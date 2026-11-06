@@ -1,16 +1,35 @@
-name: SSH VPS Runner
+name: Fixed SSH VPS
 
 on:
-  workflow_dispatch: # इसे Actions टैब से मैन्युअली रन करने के लिए
+  workflow_dispatch:
+    inputs:
+      ssh_password:
+        description: 'Set custom sudo/root password'
+        required: true
+        default: 'vpspass123'
 
 jobs:
-  ssh-session:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Setup SSH Password & Service
+        run: |
+          echo "runner:${{ github.event.inputs.ssh_password }}" | sudo chpasswd
+          echo "root:${{ github.event.inputs.ssh_password }}" | sudo chpasswd
+          sudo apt-get update && sudo apt-get install -y openssh-server
+          sudo systemctl start ssh
 
-      - name: Setup Tmate SSH Session
-        uses: mxschmitt/action-tmate@v3
-        with:
-          detached: false # जब तक आप SSH में 'exit' नहीं करेंगे, यह चालू रहेगा
+      - name: Setup Ngrok SSH Tunnel
+        run: |
+          curl -s https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz -o ngrok.tgz
+          tar -xvzf ngrok.tgz
+          sudo mv ngrok /usr/local/bin/
+          ngrok config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
+          ngrok tcp 22 --log=stdout &
+          sleep 5
+          curl -s http://127.0.0.1:4040/api/tunnels | grep -o 'tcp://[^"]*'
+
+      - name: Keep Runner Alive
+        run: |
+          echo "SSH Session Active! Sleep loop running..."
+          while true; do sleep 300; done
