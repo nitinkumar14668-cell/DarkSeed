@@ -6,7 +6,7 @@ on:
       ssh_password:
         description: 'Set custom root password'
         required: true
-        default: 'root'
+        default: 'vpspass123'
 
 jobs:
   vps:
