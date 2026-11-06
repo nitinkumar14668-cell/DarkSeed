@@ -1,0 +1,16 @@
+name: SSH VPS Runner
+
+on:
+  workflow_dispatch: # इसे Actions टैब से मैन्युअली रन करने के लिए
+
+jobs:
+  ssh-session:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Tmate SSH Session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          detached: false # जब तक आप SSH में 'exit' नहीं करेंगे, यह चालू रहेगा
