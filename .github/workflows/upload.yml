@@ -1,0 +1,51 @@
+name: Auto YouTube Shorts
+
+on:
+  schedule:
+    - cron: '30 4 * * *'   # रोज़ सुबह 10:00 AM IST (UTC 4:30)
+  workflow_dispatch:        # मैन्युअल टेस्ट रन के लिए
+
+permissions:
+  contents: write           # repo में video/topics commit करने के लिए
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Devanagari font
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fonts-noto-core
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Create and upload Short
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_PRIVACY: ${{ vars.YT_PRIVACY || 'private' }}
+          VIDEO_BASE: "Video/Published And Created"
+        run: python auto_shorts.py
+
+      - name: Save videos, topics and log to repo
+        if: always()   # upload fail hone par bhi Created wali video save ho
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p "Video/Published And Created/Created" "Video/Published And Created/Published"
+          touch used_topics.txt published_log.txt
+          git add -A used_topics.txt published_log.txt "Video"
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: new short + update video folders"
+            git pull --rebase
+            git push
+          fi
