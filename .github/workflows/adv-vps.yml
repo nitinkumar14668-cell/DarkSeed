@@ -1,0 +1,61 @@
+name: Fixed Port Tailscale VPS
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_password:
+        description: 'Set custom root password'
+        required: true
+        default: 'vpspass123'
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  vps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Password & SSH Server
+        run: |
+          echo "root:${{ github.event.inputs.ssh_password }}" | sudo chpasswd
+          echo "runner:${{ github.event.inputs.ssh_password }}" | sudo chpasswd
+          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo systemctl restart ssh
+
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Auto-Rerun Trigger in 5 Hours
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_FILE: vps.yml
+          REF: ${{ github.ref_name }}
+          SSH_PASS: ${{ github.event.inputs.ssh_password }}
+        run: |
+          echo "VPS running on Tailscale network!"
+          tailscale ip -4
+
+          # Background me 5 ghante (18000s) ka timer
+          (
+            echo "[Timer] 5 ghante ka countdown shuru..."
+            sleep 18000
+            echo "[Trigger] Naya workflow trigger kiya ja raha hai..."
+            curl -s -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_FILE/dispatches \
+              -d "{\"ref\":\"$REF\",\"inputs\":{\"ssh_password\":\"$SSH_PASS\"}}"
+            echo "[Trigger] Agla runner dispatch kar diya gaya."
+          ) &
+
+          # Main loop (5 ghante 5 minute = 18300s chalega taaki naya runner pehle ready ho jaye)
+          sleep 18300
+          echo "Session complete, exiting gracefully."
