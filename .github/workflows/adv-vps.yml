@@ -109,6 +109,18 @@ jobs:
           echo "deny:   $(cargo deny --version)"
           echo "node:   $(node --version)"
 
+      - name: Expose Tools to Root SSH Session
+        run: |
+          # Single-quoted heredoc: kuch bhi expand nahi hoga, file mein literal likha jayega
+          sudo tee /etc/profile.d/zz-web3-tools.sh > /dev/null <<'EOF'
+          export RUSTUP_HOME=/home/runner/.rustup
+          export CARGO_HOME=/home/runner/.cargo
+          _CLEAN=$(echo "$PATH" | tr ':' '\n' | grep -v '^/etc/skel' | paste -sd: -)
+          export PATH="/home/runner/.local/share/solana/install/active_release/bin:/home/runner/.cargo/bin:/home/runner/.avm/bin:$_CLEAN"
+          unset _CLEAN
+          EOF
+          sudo chmod 644 /etc/profile.d/zz-web3-tools.sh
+
       - name: Setup Password & SSH Server (Fixed Port)
         run: |
           echo "root:$SSH_PASS" | sudo chpasswd
@@ -117,8 +129,10 @@ jobs:
           # Ubuntu socket activation port 22 pe lock karta hai, isko band karo
           sudo systemctl disable --now ssh.socket || true
 
+          # 00- prefix zaroori hai: sshd pehli value leta hai, aur 50-cloud-init.conf
+          # PasswordAuthentication no set karti hai
           sudo mkdir -p /etc/ssh/sshd_config.d
-          sudo tee /etc/ssh/sshd_config.d/99-vps.conf > /dev/null <<EOF
+          sudo tee /etc/ssh/sshd_config.d/00-vps.conf > /dev/null <<EOF
           Port ${SSH_PORT}
           PermitRootLogin yes
           PasswordAuthentication yes
@@ -130,6 +144,7 @@ jobs:
           sudo systemctl enable ssh
           sudo systemctl restart ssh
           sleep 2
+          sudo sshd -T | grep -E '^(port|permitrootlogin|passwordauthentication) '
           sudo ss -tlnp | grep ":${SSH_PORT}" || { echo "sshd port pe listen nahi kar raha"; exit 1; }
 
       - name: Connect Tailscale
@@ -143,7 +158,8 @@ jobs:
           TS_IP=$(tailscale ip -4 | head -n1)
           echo "VPS running on Tailscale network!"
           echo "Tailscale IP: $TS_IP"
-          echo "SSH: ssh -p $SSH_PORT root@$TS_IP   (ya runner@$TS_IP)"
+          echo "SSH (root): ssh -p $SSH_PORT root@$TS_IP"
+          echo "SSH (runner, tools seedhe PATH mein): ssh -p $SSH_PORT runner@$TS_IP"
 
       - name: Auto-Rerun Trigger in 5 Hours
         env:
