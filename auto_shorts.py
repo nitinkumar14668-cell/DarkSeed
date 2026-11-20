@@ -3,7 +3,7 @@ import subprocess
 import random
 import google.generativeai as genai
 from PIL import Image, ImageDraw, ImageFont
-import moviepy.editor as mp
+from moviepy import *
 # YouTube upload ke liye aapka existing code yahan aayega (main niche sirf core logic bata raha hoon)
 
 # ==========================================
