@@ -1,187 +1,175 @@
 import os
-import json
-import glob
-import shutil
-import asyncio
-from datetime import datetime, timedelta, timezone
+import subprocess
+import random
+import google.generativeai as genai
+from PIL import Image, ImageDraw, ImageFont
+import moviepy.editor as mp
+# YouTube upload ke liye aapka existing code yahan aayega (main niche sirf core logic bata raha hoon)
 
-import edge_tts
-from google import genai
-from google.genai import types
-from moviepy import AudioFileClip, ColorClip, TextClip, CompositeVideoClip
-from google.oauth2.credentials import Credentials
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
+# ==========================================
+# 1. Setup and Configurations
+# ==========================================
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+genai.configure(api_key=GEMINI_API_KEY)
 
-# --- SETTINGS ---
-VOICE = "hi-IN-MadhurNeural"          # English के लिए: "en-US-ChristopherNeural"
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
-USED_FILE = "used_topics.txt"
-LOG_FILE = "published_log.txt"
-FALLBACK_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-IST = timezone(timedelta(hours=5, minutes=30))
-RETENTION_DAYS = 30                   # 30 दिन बाद Created और Published से file हटेगी
+# Example song list (Aap isko dynamic kar sakte hain)
+SONGS_TO_PROCESS = [
+    {"title": "Ishq Mubarak", "emotion": "romantic, warm, cinematic"},
+    {"title": "Feel The Pain", "emotion": "sad, black and white, emotional, crying"},
+]
 
-# GitHub पर: VIDEO_BASE = "Video/Published And Created" (repo के अंदर)
-# Termux पर: कुछ set न करें, तो ~/Video/Published And Created इस्तेमाल होगा
-BASE_DIR = os.environ.get("VIDEO_BASE", os.path.expanduser("~/Video/Published And Created"))
-CREATED_DIR = os.path.join(BASE_DIR, "Created")
-PUBLISHED_DIR = os.path.join(BASE_DIR, "Published")
+def create_directories():
+    os.makedirs("Video/Published And Created/Created", exist_ok=True)
+    os.makedirs("temp_assets", exist_ok=True)
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+# ==========================================
+# 2. Download Song (yt-dlp)
+# ==========================================
+def download_song(song_name):
+    print(f"Downloading: {song_name}...")
+    # YouTube se search karke audio download karega
+    # Note: Copyright strike se bachne ke liye legal source use karein
+    search_query = f"ytsearch1:{song_name} audio"
+    subprocess.run([
+        "yt-dlp", "-x", "--audio-format", "mp3", 
+        "-o", "temp_assets/original_song.mp3", 
+        search_query
+    ], check=True)
 
+# ==========================================
+# 3. Slowed + Reverb + Lofi Edit (FFmpeg)
+# ==========================================
+def edit_audio():
+    print("Applying Slowed + Reverb effects...")
+    input_file = "temp_assets/original_song.mp3"
+    output_file = "temp_assets/edited_song.mp3"
+    
+    # FFmpeg filter: 0.8x speed (slowed) + Echo/Reverb
+    # asetrate = sample rate badal kar pitch slow karta hai
+    # atempo = tempo adjust karta hai
+    # aecho = reverb effect deta hai
+    ffmpeg_cmd = [
+        "ffmpeg", "-y", "-i", input_file,
+        "-filter:a", "asetrate=44100*0.8,aresample=44100,atempo=1.0,aecho=0.8:0.9:1000:0.3",
+        "-b:a", "192k", output_file
+    ]
+    subprocess.run(ffmpeg_cmd, check=True)
+    return output_file
 
-# --- HELPERS ---
-def find_font():
-    matches = (glob.glob("/usr/share/fonts/**/*Devanagari*Bold*.ttf", recursive=True)
-               or glob.glob("/usr/share/fonts/**/*Devanagari*.ttf", recursive=True))
-    return matches[0] if matches else FALLBACK_FONT
-
-
-def load_used():
-    if not os.path.exists(USED_FILE):
-        return []
-    with open(USED_FILE, encoding="utf-8") as f:
-        return [line.strip() for line in f if line.strip()]
-
-
-def save_used(topic):
-    with open(USED_FILE, "a", encoding="utf-8") as f:
-        f.write(topic + "\n")
-
-
-def log_publish(video_id, topic, when):
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{when} | {topic} | {video_id}\n")
-
-
-def cleanup_old_files():
-    """Created और Published folder से 30 दिन पुरानी video/audio files हटाता है।
-    File का timer उसके नाम वाले timestamp (YYYYMMDD_HHMMSS) से चलता है।"""
-    cutoff = datetime.now(IST) - timedelta(days=RETENTION_DAYS)
-    removed = 0
-
-    for folder in (CREATED_DIR, PUBLISHED_DIR):
-        for path in glob.glob(os.path.join(folder, "*")):
-            stem = os.path.splitext(os.path.basename(path))[0]
-            try:
-                created_at = datetime.strptime(stem, "%Y%m%d_%H%M%S").replace(tzinfo=IST)
-            except ValueError:
-                continue   # हमारी file नहीं है, इसे न छुएं
-
-            if created_at < cutoff:
-                os.remove(path)
-                removed += 1
-                print(f"Deleted (30+ days): {path}")
-
-    print(f"Cleanup done. {removed} purani file(s) हटाई।")
-
-
-# --- 1. SCRIPT + TOPIC (Gemini) ---
-def get_script():
-    avoid = "\n".join(load_used()[-200:]) or "कोई नहीं"
+# ==========================================
+# 4. Google AI Studio (Gemini) se Image Generate karna
+# ==========================================
+def generate_ai_image(song_title, emotion):
+    print(f"Generating AI Image for {song_title}...")
+    
+    # Prompt setup (9:16 aspect ratio for Shorts)
     prompt = f"""
-तुम एक YouTube Shorts स्क्रिप्ट लेखक हो। एक दिलचस्प, सही तथ्यों वाला, लगभग 30 सेकंड का विषय चुनो।
-ये विषय पहले इस्तेमाल हो चुके हैं, इन्हें दोबारा मत चुनो:
-{avoid}
+    A cinematic, ultra-realistic portrait for a YouTube thumbnail. 
+    Mood: {emotion}. 
+    Song title: {song_title}.
+    Style: High contrast, moody lighting, beautiful depth of field, blurred background. 
+    The image should look emotional and top-class, like a movie poster.
+    Aspect ratio: 9:16 (vertical portrait).
+    """
+    
+    try:
+        # Imagen 3 model use karna (Gemini API ke through)
+        model = genai.ImageGenerationModel("imagen-3.0-generate-001")
+        response = model.generate_images(
+            prompt=prompt,
+            number_of_images=1,
+            aspect_ratio="9:16",
+        )
+        
+        image_path = "temp_assets/ai_background.png"
+        response.images[0].save(image_path)
+        return image_path
+    except Exception as e:
+        print(f"AI Image Generation failed (Fallback to gradient): {e}")
+        # Fallback: Black gradient background agar API fail ho jaye
+        img = Image.new('RGB', (1080, 1920), color=(20, 20, 20))
+        img.save("temp_assets/ai_background.png")
+        return "temp_assets/ai_background.png"
 
-सिर्फ JSON लौटाओ:
-{{"topic": "विषय का छोटा शीर्षक (हिंदी में)",
-  "script": "नरेशन हिंदी (देवनागरी) में, 60 शब्दों से कम, बिना stage directions के"}}
-"""
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=prompt,
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
-    )
-    data = json.loads(response.text)
-    return data["topic"].strip(), data["script"].strip()
+# ==========================================
+# 5. Thumbnail par Text Add karna (Pillow)
+# ==========================================
+def create_thumbnail_with_text(image_path, song_title):
+    print("Adding stylish text to thumbnail...")
+    img = Image.open(image_path)
+    draw = ImageDraw.Draw(img)
+    
+    # Fonts setup
+    try:
+        # GitHub action mein fonts install kar liye hain
+        font_title = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 120)
+        font_sub = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 60)
+    except:
+        font_title = ImageFont.load_default()
+        font_sub = ImageFont.load_default()
 
+    # Text positions (Center me)
+    title_text = song_title
+    sub_text = "Slowed + Reverb"
+    
+    # Text ka shadow effect
+    draw.text((540, 1500), title_text, font=font_title, fill="white", anchor="mm")
+    draw.text((540, 1650), sub_text, font=font_sub, fill="yellow", anchor="mm")
+    
+    thumbnail_path = "temp_assets/final_thumbnail.jpg"
+    img.convert("RGB").save(thumbnail_path, quality=95)
+    return thumbnail_path
 
-# --- 2. VOICE (edge-tts, free) ---
-async def generate_voice(text, path):
-    await edge_tts.Communicate(text, voice=VOICE).save(path)
+# ==========================================
+# 6. Video Create karna (MoviePy / FFmpeg)
+# ==========================================
+def create_video(thumbnail_path, audio_path):
+    print("Creating final YouTube Short video...")
+    output_video = "Video/Published And Created/Created/short_video.mp4"
+    
+    # FFmpeg command to combine image + audio into video (Shorts 9:16)
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", thumbnail_path,
+        "-i", audio_path,
+        "-c:v", "libx264", "-tune", "stillimage",
+        "-c:a", "aac", "-b:a", "192k",
+        "-pix_fmt", "yuv420p", "-shortest",
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920", # Force 9:16
+        output_video
+    ]
+    subprocess.run(cmd, check=True)
+    return output_video
 
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+def main():
+    create_directories()
+    
+    # Random song pick karte hain (ya list se ek-ek karke process karein)
+    song = random.choice(SONGS_TO_PROCESS)
+    print(f"Selected Song: {song['title']}")
+    
+    # 1. Download
+    download_song(song['title'])
+    
+    # 2. Edit Audio
+    edited_audio = edit_audio()
+    
+    # 3. AI Image
+    ai_image = generate_ai_image(song['title'], song['emotion'])
+    
+    # 4. Thumbnail
+    thumbnail = create_thumbnail_with_text(ai_image, song['title'])
+    
+    # 5. Create Video
+    video_path = create_video(thumbnail, edited_audio)
+    
+    print(f"Success! Video ready at: {video_path}")
+    
+    # 6. Yahan aapka YouTube Upload function call hoga
+    # upload_to_youtube(video_path, song['title'], thumbnail)
 
-# --- 3. VIDEO (moviepy 2.x) ---
-def create_video(title, audio_path, out_path):
-    audio = AudioFileClip(audio_path)
-    dur = audio.duration
-
-    bg = ColorClip(size=(1080, 1920), color=(15, 15, 20)).with_duration(dur)  # 9:16
-    txt = (TextClip(font=find_font(), text=title, font_size=80, color="yellow",
-                    method="caption", size=(960, None), text_align="center")
-           .with_position(("center", 500))
-           .with_duration(dur))
-
-    video = CompositeVideoClip([bg, txt], size=(1080, 1920)).with_audio(audio)
-    video.write_videofile(out_path, fps=24, codec="libx264", audio_codec="aac")
-    video.close()
-    audio.close()
-
-
-# --- 4. UPLOAD ---
-def upload_to_youtube(video_path, title, description):
-    creds = Credentials(
-        None,
-        refresh_token=os.environ["YT_REFRESH_TOKEN"],
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=os.environ["YT_CLIENT_ID"],
-        client_secret=os.environ["YT_CLIENT_SECRET"],
-        scopes=SCOPES,
-    )
-    youtube = build("youtube", "v3", credentials=creds)
-
-    body = {
-        "snippet": {
-            "title": f"{title} #Shorts"[:100],
-            "description": f"{description}\n\n#Shorts #facts",
-            "tags": ["shorts", "facts"],
-            "categoryId": "27",
-        },
-        "status": {
-            "privacyStatus": os.environ.get("YT_PRIVACY", "private"),
-            "selfDeclaredMadeForKids": False,
-        },
-    }
-    media = MediaFileUpload(video_path, chunksize=-1, resumable=True, mimetype="video/mp4")
-    response = youtube.videos().insert(part="snippet,status", body=body, media_body=media).execute()
-    video_id = response["id"]
-    print(f"Uploaded! https://youtube.com/shorts/{video_id}")
-    return video_id
-
-
-# --- MAIN ---
 if __name__ == "__main__":
-    os.makedirs(CREATED_DIR, exist_ok=True)
-    os.makedirs(PUBLISHED_DIR, exist_ok=True)
-
-    print("0. Purani files cleanup...")
-    cleanup_old_files()
-
-    now = datetime.now(IST)
-    stamp = now.strftime("%Y%m%d_%H%M%S")
-    audio_path = os.path.join(CREATED_DIR, f"{stamp}.mp3")
-    video_path = os.path.join(CREATED_DIR, f"{stamp}.mp4")
-
-    print("1. Script generate...")
-    topic, script = get_script()
-    print("Topic:", topic)
-    print("Script:", script)
-
-    print("2. Voice generate...")
-    asyncio.run(generate_voice(script, audio_path))
-
-    print("3. Video build -> Created folder...")
-    create_video(topic, audio_path, video_path)
-
-    print("4. Upload...")
-    video_id = upload_to_youtube(video_path, topic, script)
-
-    print("5. Published folder mein move...")
-    for src in (video_path, audio_path):
-        shutil.move(src, os.path.join(PUBLISHED_DIR, os.path.basename(src)))
-
-    save_used(topic)
-    log_publish(video_id, topic, now.strftime("%Y-%m-%d %H:%M IST"))
-    print("Done.")
+    main()
