@@ -1,6 +1,7 @@
-google-genai
-edge-tts
-moviepy>=2.0
+google-generativeai
+yt-dlp
+moviepy
+Pillow
 google-api-python-client
-google-auth
 google-auth-oauthlib
+google-auth-httplib2 
