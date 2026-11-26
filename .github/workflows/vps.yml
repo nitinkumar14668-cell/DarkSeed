@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       ssh_password:
-        description: 'Set custom root password (also used as VNC password)'
+        description: 'Root/SSH password (min 6 char; VNC pehle 8 char use karega)'
         required: true
         default: 'vpspass123'
       solana_version:
@@ -15,6 +15,10 @@ on:
         description: 'Anchor CLI version'
         required: false
         default: '0.31.1'
+      vnc_resolution:
+        description: 'GUI resolution (jaise 1280x720)'
+        required: false
+        default: '1280x720'
 
 permissions:
   actions: write
@@ -22,17 +26,15 @@ permissions:
 
 jobs:
   vps:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
     env:
       SSH_PORT: 2222
+      VNC_PORT: 5901
       SSH_PASS: ${{ github.event.inputs.ssh_password }}
       SOLANA_VERSION: ${{ github.event.inputs.solana_version }}
       ANCHOR_VERSION: ${{ github.event.inputs.anchor_version }}
-      VNC_PORT: 5901          # VNC display :1 => 5901
-      VNC_GEOMETRY: 1280x720
-      VNC_DEPTH: 24
-
+      VNC_RESOLUTION: ${{ github.event.inputs.vnc_resolution }}
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -41,6 +43,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev libclang-dev protobuf-compiler jq
+
+      - name: Install GUI (XFCE + TigerVNC)
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            xfce4 xfce4-terminal dbus-x11 x11-xserver-utils \
+            tigervnc-standalone-server tigervnc-tools \
+            xfonts-base fonts-dejavu adwaita-icon-theme
 
       - name: Cache Solana & Anchor Toolchain
         uses: actions/cache@v4
@@ -157,63 +166,34 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           args: --hostname=fixed-port-vps-${{ github.run_id }}
 
-      # ⬇️ NAYA STEP: GUI + VNC SERVER (XFCE + TigerVNC)
-      - name: Setup GUI (XFCE) & VNC Server
+      - name: Start GUI (VNC Server)
         run: |
-          export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update
-          sudo apt-get install -y \
-            xfce4 xfce4-goodies \
-            tigervnc-standalone-server tigervnc-common \
-            dbus-x11 xterm x11-utils
-
           mkdir -p ~/.vnc
-
-          # VNC password = SSH password (max 8 chars use karega)
-          echo "$SSH_PASS" | vncpasswd -f > ~/.vnc/passwd
+          printf '%s' "$SSH_PASS" | tigervncpasswd -f > ~/.vnc/passwd
           chmod 600 ~/.vnc/passwd
 
-          # XFCE session start karne ke liye xstartup
-          cat > ~/.vnc/xstartup <<'EOF'
-          #!/bin/sh
-          unset SESSION_MANAGER
-          unset DBUS_SESSION_BUS_ADDRESS
-          xrdb $HOME/.Xresources
-          startxfce4 &
-          EOF
-          chmod +x ~/.vnc/xstartup
+          nohup Xtigervnc :1 \
+            -geometry "${VNC_RESOLUTION:-1280x720}" -depth 24 \
+            -rfbport "$VNC_PORT" -localhost=0 \
+            -SecurityTypes VncAuth -PasswordFile "$HOME/.vnc/passwd" \
+            -AlwaysShared > ~/.vnc/xvnc.log 2>&1 &
+          sleep 3
 
-          # VNC server ko sabhi interfaces par bind karo (0.0.0.0), taaki Tailscale IP se reachable ho
-          # TigerVNC default localhost par bind karta hai; config file se override karo
-          echo "localhost=no" > ~/.vnc/config
-          echo "geometry=${VNC_GEOMETRY}" >> ~/.vnc/config
-          echo "depth=${VNC_DEPTH}" >> ~/.vnc/config
-          echo "session=xfce" >> ~/.vnc/config
+          DISPLAY=:1 nohup dbus-launch --exit-with-session startxfce4 > ~/.vnc/xfce.log 2>&1 &
+          sleep 8
 
-          # Start VNC on display :1 (port 5901)
-          vncserver :1 -geometry "${VNC_GEOMETRY}" -depth "${VNC_DEPTH}" -localhost no
-
-          # Verify listen
-          sleep 2
-          sudo ss -tlnp | grep ":${VNC_PORT}" && echo "✅ VNC listening on port ${VNC_PORT}" || { echo "❌ VNC listen nahi kar raha"; exit 1; }
+          ss -tln | grep -q ":${VNC_PORT} " || { echo "VNC start nahi hua"; cat ~/.vnc/xvnc.log; exit 1; }
+          pgrep -f xfce4-session >/dev/null || { echo "XFCE start nahi hua"; cat ~/.vnc/xfce.log; exit 1; }
+          echo "GUI ready"
 
       - name: Show Connection Info
         run: |
           TS_IP=$(tailscale ip -4 | head -n1)
           echo "VPS running on Tailscale network!"
           echo "Tailscale IP: $TS_IP"
-          echo ""
-          echo "=== SSH ==="
-          echo "SSH (root):   ssh -p $SSH_PORT root@$TS_IP"
-          echo "SSH (runner): ssh -p $SSH_PORT runner@$TS_IP   # tools seedhe PATH mein"
-          echo ""
-          echo "=== GUI (VNC) ==="
-          echo "Kisi bhi VNC viewer se connect karo:"
-          echo "  Address : $TS_IP:$VNC_PORT   (ya vnc://$TS_IP:$VNC_PORT)"
-          echo "  Password: $SSH_PASS  (max 8 chars, TigerVNC truncate karega)"
-          echo ""
-          echo "RealVNC / TightVNC / TigerVNC / Remmina — sab chalega."
-          echo "VNC server display :1 par chal raha hai (port $VNC_PORT)."
+          echo "SSH (root): ssh -p $SSH_PORT root@$TS_IP"
+          echo "SSH (runner, tools seedhe PATH mein): ssh -p $SSH_PORT runner@$TS_IP"
+          echo "VNC (GUI): $TS_IP:$VNC_PORT  | password: SSH password ke pehle 8 characters"
 
       - name: Auto-Rerun Trigger in 5 Hours
         env:
@@ -231,7 +211,8 @@ jobs:
               --arg pw "$SSH_PASS" \
               --arg sv "$SOLANA_VERSION" \
               --arg av "$ANCHOR_VERSION" \
-              '{ref: $ref, inputs: {ssh_password: $pw, solana_version: $sv, anchor_version: $av}}')
+              --arg res "$VNC_RESOLUTION" \
+              '{ref: $ref, inputs: {ssh_password: $pw, solana_version: $sv, anchor_version: $av, vnc_resolution: $res}}')
             if curl -sf -X POST \
               -H "Accept: application/vnd.github+json" \
               -H "Authorization: Bearer $GH_TOKEN" \
