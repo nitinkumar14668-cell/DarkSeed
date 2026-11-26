@@ -4,29 +4,245 @@ on:
   workflow_dispatch:
     inputs:
       ssh_password:
-        description: 'Set custom root password'
+        description: 'Set custom root password (also used as VNC password)'
         required: true
         default: 'vpspass123'
+      solana_version:
+        description: 'Solana/Agave CLI version (stable ya v2.1.14 jaisa)'
+        required: false
+        default: 'stable'
+      anchor_version:
+        description: 'Anchor CLI version'
+        required: false
+        default: '0.31.1'
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   vps:
     runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      SSH_PORT: 2222
+      SSH_PASS: ${{ github.event.inputs.ssh_password }}
+      SOLANA_VERSION: ${{ github.event.inputs.solana_version }}
+      ANCHOR_VERSION: ${{ github.event.inputs.anchor_version }}
+      VNC_PORT: 5901          # VNC display :1 => 5901
+      VNC_GEOMETRY: 1280x720
+      VNC_DEPTH: 24
+
     steps:
-      - name: Setup Password & SSH Server
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install System Build Deps
         run: |
-          echo "root:${{ github.event.inputs.ssh_password }}" | sudo chpasswd
-          echo "runner:${{ github.event.inputs.ssh_password }}" | sudo chpasswd
-          sudo sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
-          sudo sed -i 's/PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libssl-dev libudev-dev libclang-dev protobuf-compiler jq
+
+      - name: Cache Solana & Anchor Toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.local/share/solana
+            ~/.avm
+            ~/.cargo/bin/avm
+          key: solana-${{ env.SOLANA_VERSION }}-anchor-${{ env.ANCHOR_VERSION }}-${{ runner.os }}
+
+      - name: Install Rust Components
+        run: |
+          rustup component add clippy rustfmt || true
+          rustc --version
+          cargo --version
+
+      - name: Install Solana CLI
+        run: |
+          SOLANA_BIN="$HOME/.local/share/solana/install/active_release/bin"
+          if [ ! -x "$SOLANA_BIN/solana" ]; then
+            if [ "$SOLANA_VERSION" = "stable" ]; then
+              URL="https://release.anza.xyz/stable/install"
+            else
+              URL="https://release.anza.xyz/${SOLANA_VERSION}/install"
+            fi
+            sh -c "$(curl -sSfL "$URL")"
+          fi
+          echo "$SOLANA_BIN" >> "$GITHUB_PATH"
+          "$SOLANA_BIN/solana" --version
+
+      - name: Install Anchor via avm
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
+          if ! command -v avm >/dev/null 2>&1; then
+            cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+          fi
+          avm install "$ANCHOR_VERSION"
+          avm use "$ANCHOR_VERSION"
+          echo "$HOME/.avm/bin" >> "$GITHUB_PATH"
+          "$HOME/.avm/bin/anchor" --version
+
+      - name: Install Security & Bug-Hunting Tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: Setup Node Package Managers
+        run: |
+          corepack enable
+          corepack prepare pnpm@latest --activate || true
+          node --version
+          yarn --version || true
+
+      - name: Create Local Solana Keypair
+        run: |
+          mkdir -p ~/.config/solana
+          if [ ! -f ~/.config/solana/id.json ]; then
+            solana-keygen new --no-bip39-passphrase -s -o ~/.config/solana/id.json
+          fi
+          solana config set --url localhost >/dev/null
+          solana address
+
+      - name: Verify Toolchain
+        run: |
+          echo "rustc:  $(rustc --version)"
+          echo "cargo:  $(cargo --version)"
+          echo "solana: $(solana --version)"
+          echo "anchor: $(anchor --version)"
+          echo "audit:  $(cargo audit --version)"
+          echo "deny:   $(cargo deny --version)"
+          echo "node:   $(node --version)"
+
+      - name: Expose Tools to Root SSH Session
+        run: |
+          # Single-quoted heredoc: kuch bhi expand nahi hoga, file mein literal likha jayega
+          sudo tee /etc/profile.d/zz-web3-tools.sh > /dev/null <<'EOF'
+          export RUSTUP_HOME=/home/runner/.rustup
+          export CARGO_HOME=/home/runner/.cargo
+          _CLEAN=$(echo "$PATH" | tr ':' '\n' | grep -v '^/etc/skel' | paste -sd: -)
+          export PATH="/home/runner/.local/share/solana/install/active_release/bin:/home/runner/.cargo/bin:/home/runner/.avm/bin:$_CLEAN"
+          unset _CLEAN
+          EOF
+          sudo chmod 644 /etc/profile.d/zz-web3-tools.sh
+
+      - name: Setup Password & SSH Server (Fixed Port)
+        run: |
+          echo "root:$SSH_PASS" | sudo chpasswd
+          echo "runner:$SSH_PASS" | sudo chpasswd
+
+          # Ubuntu socket activation port 22 pe lock karta hai, isko band karo
+          sudo systemctl disable --now ssh.socket || true
+
+          # 00- prefix zaroori hai: sshd pehli value leta hai, aur 50-cloud-init.conf
+          # PasswordAuthentication no set karti hai
+          sudo mkdir -p /etc/ssh/sshd_config.d
+          sudo tee /etc/ssh/sshd_config.d/00-vps.conf > /dev/null <<EOF
+          Port ${SSH_PORT}
+          PermitRootLogin yes
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication yes
+          UsePAM yes
+          EOF
+
+          sudo sshd -t
+          sudo systemctl enable ssh
           sudo systemctl restart ssh
+          sleep 2
+          sudo sshd -T | grep -E '^(port|permitrootlogin|passwordauthentication) '
+          sudo ss -tlnp | grep ":${SSH_PORT}" || { echo "sshd port pe listen nahi kar raha"; exit 1; }
 
       - name: Connect Tailscale
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          args: --hostname=fixed-port-vps-${{ github.run_id }}
 
-      - name: Runner Active Loop
+      # ⬇️ NAYA STEP: GUI + VNC SERVER (XFCE + TigerVNC)
+      - name: Setup GUI (XFCE) & VNC Server
         run: |
-          echo "VPS Ready on Tailscale network!"
-          tailscale ip -4
-          while true; do sleep 300; done
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update
+          sudo apt-get install -y \
+            xfce4 xfce4-goodies \
+            tigervnc-standalone-server tigervnc-common \
+            dbus-x11 xterm x11-utils
+
+          mkdir -p ~/.vnc
+
+          # VNC password = SSH password (max 8 chars use karega)
+          echo "$SSH_PASS" | vncpasswd -f > ~/.vnc/passwd
+          chmod 600 ~/.vnc/passwd
+
+          # XFCE session start karne ke liye xstartup
+          cat > ~/.vnc/xstartup <<'EOF'
+          #!/bin/sh
+          unset SESSION_MANAGER
+          unset DBUS_SESSION_BUS_ADDRESS
+          xrdb $HOME/.Xresources
+          startxfce4 &
+          EOF
+          chmod +x ~/.vnc/xstartup
+
+          # VNC server ko sabhi interfaces par bind karo (0.0.0.0), taaki Tailscale IP se reachable ho
+          # TigerVNC default localhost par bind karta hai; config file se override karo
+          echo "localhost=no" > ~/.vnc/config
+          echo "geometry=${VNC_GEOMETRY}" >> ~/.vnc/config
+          echo "depth=${VNC_DEPTH}" >> ~/.vnc/config
+          echo "session=xfce" >> ~/.vnc/config
+
+          # Start VNC on display :1 (port 5901)
+          vncserver :1 -geometry "${VNC_GEOMETRY}" -depth "${VNC_DEPTH}" -localhost no
+
+          # Verify listen
+          sleep 2
+          sudo ss -tlnp | grep ":${VNC_PORT}" && echo "✅ VNC listening on port ${VNC_PORT}" || { echo "❌ VNC listen nahi kar raha"; exit 1; }
+
+      - name: Show Connection Info
+        run: |
+          TS_IP=$(tailscale ip -4 | head -n1)
+          echo "VPS running on Tailscale network!"
+          echo "Tailscale IP: $TS_IP"
+          echo ""
+          echo "=== SSH ==="
+          echo "SSH (root):   ssh -p $SSH_PORT root@$TS_IP"
+          echo "SSH (runner): ssh -p $SSH_PORT runner@$TS_IP   # tools seedhe PATH mein"
+          echo ""
+          echo "=== GUI (VNC) ==="
+          echo "Kisi bhi VNC viewer se connect karo:"
+          echo "  Address : $TS_IP:$VNC_PORT   (ya vnc://$TS_IP:$VNC_PORT)"
+          echo "  Password: $SSH_PASS  (max 8 chars, TigerVNC truncate karega)"
+          echo ""
+          echo "RealVNC / TightVNC / TigerVNC / Remmina — sab chalega."
+          echo "VNC server display :1 par chal raha hai (port $VNC_PORT)."
+
+      - name: Auto-Rerun Trigger in 5 Hours
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_FILE: vps.yml
+          REF: ${{ github.ref_name }}
+        run: |
+          (
+            echo "[Timer] 5 ghante ka countdown shuru..."
+            sleep 18000
+            echo "[Trigger] Naya workflow trigger kiya ja raha hai..."
+            BODY=$(jq -n \
+              --arg ref "$REF" \
+              --arg pw "$SSH_PASS" \
+              --arg sv "$SOLANA_VERSION" \
+              --arg av "$ANCHOR_VERSION" \
+              '{ref: $ref, inputs: {ssh_password: $pw, solana_version: $sv, anchor_version: $av}}')
+            if curl -sf -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$REPO/actions/workflows/$WORKFLOW_FILE/dispatches" \
+              -d "$BODY"; then
+              echo "[Trigger] Agla runner dispatch kar diya gaya."
+            else
+              echo "[Trigger] Dispatch FAILED"
+            fi
+          ) &
+
+          # 5 ghante 5 minute: naya runner pehle ready ho jaye
+          sleep 18300
+          echo "Session complete, exiting gracefully."
