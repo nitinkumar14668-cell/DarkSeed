@@ -153,6 +153,10 @@ jobs:
           UsePAM yes
           EOF
 
+          # sshd -t se pehle yeh directory honi chahiye
+          sudo mkdir -p /run/sshd
+          sudo chmod 755 /run/sshd
+
           sudo sshd -t
           sudo systemctl enable ssh
           sudo systemctl restart ssh
